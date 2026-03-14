@@ -33,6 +33,7 @@ from openpilot.common.constants import CV
 from openpilot.selfdrive.carrot.carrot_serv import CarrotServ
 
 from openpilot.common.gps import get_gps_location_service
+from openpilot.selfdrive.carrot.nav_route_utils import build_navi_speed_profile
 
 try:
   from shapely.geometry import LineString
@@ -49,147 +50,6 @@ NetworkType = log.DeviceState.NetworkType
 V_CURVE_LOOKUP_BP = [0., 1./800., 1./670., 1./560., 1./440., 1./360., 1./265., 1./190., 1./135., 1./85., 1./55., 1./30., 1./25.]
 V_CRUVE_LOOKUP_VALS = [300, 150, 120, 110, 100, 90, 80, 70, 60, 50, 40, 15, 5]
 
-# Haversine formula to calculate distance between two GPS coordinates
-#haversine_cache = {}
-def haversine(lon1, lat1, lon2, lat2):
-    #key = (lon1, lat1, lon2, lat2)
-    #if key in haversine_cache:
-    #    return haversine_cache[key]
-
-    R = 6371000  # Radius of Earth in meters
-    phi1, phi2 = math.radians(lat1), math.radians(lat2)
-    dphi = math.radians(lat2 - lat1)
-    dlambda = math.radians(lon2 - lon1)
-
-    a = math.sin(dphi / 2) ** 2 + math.cos(phi1) * math.cos(phi2) * math.sin(dlambda / 2) ** 2
-    distance = 2 * R * math.atan2(math.sqrt(a), math.sqrt(1 - a))
-
-    #haversine_cache[key] = distance
-    return distance
-
-
-# Get the closest point on a segment between two coordinates
-def closest_point_on_segment(p1, p2, current_position):
-    x1, y1 = p1
-    x2, y2 = p2
-    px, py = current_position
-
-    dx = x2 - x1
-    dy = y2 - y1
-    if dx == 0 and dy == 0:
-        return p1  # p1 and p2 are the same point
-
-    # Parameter t is the projection factor onto the line segment
-    t = ((px - x1) * dx + (py - y1) * dy) / (dx * dx + dy * dy)
-    t = max(0, min(1, t))  # Clamp t to the segment
-
-    closest_x = x1 + t * dx
-    closest_y = y1 + t * dy
-
-    return (closest_x, closest_y)
-
-
-# Get path after a certain distance from the current position
-def get_path_after_distance(start_index, coordinates, current_position, distance_m):
-    total_distance = 0
-    path_after_distance = []
-    closest_index = -1
-    closest_point = None
-    min_distance = float('inf')
-
-    start_index = max(0, start_index - 2)
-
-    # 가까운 점만 탐색하도록 수정
-    for i in range(start_index, len(coordinates) - 1):
-        p1 = coordinates[i]
-        p2 = coordinates[i + 1]
-        candidate_point = closest_point_on_segment(p1, p2, current_position)
-        distance = haversine(current_position[0], current_position[1], candidate_point[0], candidate_point[1])
-
-        if distance < min_distance:
-            min_distance = distance
-            closest_point = candidate_point
-            closest_index = i
-        elif distance > min_distance and min_distance < 10:
-            break
-
-    start_index = closest_index
-    # Start from the closest point and calculate the path after the specified distance
-    if closest_index != -1:
-        path_after_distance.append(closest_point)
-
-        path_after_distance.append(coordinates[closest_index + 1])
-        total_distance = haversine(closest_point[0], closest_point[1], coordinates[closest_index + 1][0],
-                                   coordinates[closest_index + 1][1])
-
-        # Traverse the path forward from the next point
-        for i in range(closest_index + 1, len(coordinates) - 1):
-            coord1 = coordinates[i]
-            coord2 = coordinates[i + 1]
-            segment_distance = haversine(coord1[0], coord1[1], coord2[0], coord2[1])
-
-            if total_distance + segment_distance >= distance_m and segment_distance > 0:
-                remaining_distance = distance_m - total_distance
-                ratio = remaining_distance / segment_distance
-                interpolated_lon = coord1[0] + ratio * (coord2[0] - coord1[0])
-                interpolated_lat = coord1[1] + ratio * (coord2[1] - coord1[1])
-                path_after_distance.append((interpolated_lon, interpolated_lat))
-                break
-
-            total_distance += segment_distance
-            path_after_distance.append(coord2)
-
-    return path_after_distance, start_index, closest_point
-
-
-def calculate_angle(point1, point2):
-    delta_lon = point2[0] - point1[0]
-    delta_lat = point2[1] - point1[1]
-    return math.degrees(math.atan2(delta_lat, delta_lon))
-
-# Convert GPS coordinates to relative x, y coordinates based on a reference point and heading
-def gps_to_relative_xy(gps_path, reference_point, heading_deg):
-    ref_lon, ref_lat = reference_point
-    relative_coordinates = []
-
-    # Convert heading from degrees to radians
-    heading_rad = math.radians(heading_deg)
-
-    for lon, lat in gps_path:
-        # Convert lat/lon differences to meters (assuming small distances for simple approximation)
-        x = (lon - ref_lon) * 40008000 * math.cos(math.radians(ref_lat)) / 360
-        y = (lat - ref_lat) * 40008000 / 360
-
-        # Rotate coordinates based on the heading angle to align with the car's direction
-        x_rot = x * math.cos(heading_rad) - y * math.sin(heading_rad)
-        y_rot = x * math.sin(heading_rad) + y * math.cos(heading_rad)
-
-        relative_coordinates.append((y_rot, x_rot))
-
-    return relative_coordinates
-
-
-# Calculate curvature given three points using a faster vector-based method
-#curvature_cache = {}
-def calculate_curvature(p1, p2, p3):
-    #key = (p1, p2, p3)
-    #if key in curvature_cache:
-    #    return curvature_cache[key]
-
-    v1 = (p2[0] - p1[0], p2[1] - p1[1])
-    v2 = (p3[0] - p2[0], p3[1] - p2[1])
-
-    cross_product = v1[0] * v2[1] - v1[1] * v2[0]
-    len_v1 = math.sqrt(v1[0] ** 2 + v1[1] ** 2)
-    len_v2 = math.sqrt(v2[0] ** 2 + v2[1] ** 2)
-
-    if len_v1 * len_v2 == 0:
-        curvature = 0
-    else:
-        curvature = cross_product / (len_v1 * len_v2 * len_v1)
-
-    #curvature_cache[key] = curvature
-    return curvature
 
 class CarrotMan:
   def __init__(self):
@@ -338,105 +198,47 @@ class CarrotMan:
       if False and self.navd_active:  # mabox always active
         self.navd_active = False
         self.params.remove("NavDestination")
+
     if not self.navi_points_active or not SHAPELY_AVAILABLE or (self.carrot_serv.active_carrot <= 1 and not self.navd_active):
-      #print(f"navi_points_active: {self.navi_points_active}, active_carrot: {self.carrot_serv.active_carrot}")
       if self.navi_points_active:
         print("navi_points_active: ", self.navi_points_active, "active_carrot: ", self.carrot_serv.active_carrot, "navd_active: ", self.navd_active)
-        #haversine_cache.clear()
-        #curvature_cache.clear()
         self.navi_points = []
         self.navi_points_active = False
         if self.active_carrot_last > 1:
-          #self.params.remove("NavDestination")
           pass
       self.active_carrot_last = self.carrot_serv.active_carrot
-      return [],[],300
+      return [], [], 300
 
     current_position = (self.carrot_serv.vpPosPointLon, self.carrot_serv.vpPosPointLat)
     heading_deg = self.carrot_serv.bearing
 
-    distance_interval = 10.0
-    out_speed = 300
-    path, self.navi_points_start_index, start_point = get_path_after_distance(self.navi_points_start_index, self.navi_points, current_position, 300)
-    relative_coords = []
-    if path:
-        #relative_coords = gps_to_relative_xy(path, current_position, heading_deg)
-        relative_coords = gps_to_relative_xy(path, start_point, heading_deg)
-        # Resample relative_coords at 5m intervals using LineString
-        line = LineString(relative_coords)
-        resampled_points = []
-        resampled_distances = []
-        current_distance = 0
-        while current_distance <= line.length:
-            point = line.interpolate(current_distance)
-            resampled_points.append((point.x, point.y))
-            resampled_distances.append(current_distance)
-            current_distance += distance_interval
+    # 처음 시작값
+    lookahead_m = 200.0
+    sample_ds = 3.0
+    smooth_window = 5
+    vmax_kph = max(30.0, float(self.carrot_serv.nRoadLimitSpeed))
+    decel_mps2 = max(0.5, float(self.carrot_serv.autoNaviSpeedDecelRate))
 
-        curvatures = []
-        distances = []
-        distance = 10.0
-        sample = 4
-        if len(resampled_points) >= sample * 2 + 1:
-            # Calculate curvatures and speeds based on curvature
-            speeds = []
-            for i in range(len(resampled_points) - sample * 2):
-                distance += distance_interval
-                p1, p2, p3 = resampled_points[i], resampled_points[i + sample], resampled_points[i + sample * 2]
-                curvature = calculate_curvature(p1, p2, p3)
-                curvatures.append(curvature)
-                speed = np.interp(abs(curvature), V_CURVE_LOOKUP_BP, V_CRUVE_LOOKUP_VALS)
-                if abs(curvature) < 0.02:
-                  speed = max(speed, self.carrot_serv.nRoadLimitSpeed)
-                speeds.append(speed)
-                distances.append(distance)
-            #print(f"curvatures= {[round(s, 4) for s in curvatures]}")
-            #print(f"speeds= {[round(s, 1) for s in speeds]}")
-            # Apply acceleration limits in reverse to adjust speeds
-            accel_limit = self.carrot_serv.autoNaviSpeedDecelRate # m/s^2
-            accel_limit_kmh = accel_limit * 3.6  # Convert to km/h per second
-            out_speeds = [0] * len(speeds)
-            out_speeds[-1] = speeds[-1]  # Set the last speed as the initial value
-            v_ego_kph = self.sm['carState'].vEgo * 3.6
+    try:
+      resampled_points, resampled_distances, out_speed, next_start_index, start_point, speed_profile = build_navi_speed_profile(
+        coordinates=self.navi_points,
+        current_position=current_position,
+        heading_deg=heading_deg,
+        start_index=self.navi_points_start_index,
+        lookahead_m=lookahead_m,
+        ds=sample_ds,
+        smooth_window=smooth_window,
+        vmax_kph=vmax_kph,
+        decel_mps2=decel_mps2,
+      )
 
-            time_delay = self.carrot_serv.autoNaviSpeedCtrlEnd
-            time_wait = 0
-            for i in range(len(speeds) - 2, -1, -1):
-                target_speed = speeds[i]
-                next_out_speed = out_speeds[i + 1]
+      self.navi_points_start_index = next_start_index
+      return resampled_points, resampled_distances, out_speed
 
-                if target_speed < next_out_speed:
-                  time_delay = max(0, ((v_ego_kph - target_speed) / accel_limit_kmh))
-                  time_wait = - time_delay
-
-                # Calculate time interval for the current segment based on speed
-                time_interval = distance_interval / (next_out_speed / 3.6) if next_out_speed > 0 else 0
-
-                time_apply = min(time_interval, max(0, time_interval + time_wait))
-
-                # Calculate maximum allowed speed with acceleration limit
-                max_allowed_speed = next_out_speed + (accel_limit_kmh * time_apply)
-                adjusted_speed = min(target_speed, max_allowed_speed)
-
-                #time_wait += time_interval
-                time_wait += min(2.0, time_interval)
-
-                out_speeds[i] = adjusted_speed
-
-            #distance_advance = self.sm['carState'].vEgo * 3.0  # Advance distance by 3.0 seconds
-            #out_speed = interp(distance_advance, distances, out_speeds)
-            out_speed = out_speeds[0]
-            #print(f"out_speeds= {[round(s, 1) for s in out_speeds]}")
-    else:
-        resampled_points = []
-        resampled_distances = []
-        curvatures = []
-        speeds = []
-        distances = []
-        #self.params.remove("NavDestination")
-
-    return resampled_points, resampled_distances, out_speed #speeds, distances
-
+    except Exception as e:
+      print(f"carrot_navi_route error: {e}")
+      traceback.print_exc()
+      return [], [], 300
 
   def make_send_message(self):
     msg = {}
